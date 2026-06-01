@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(flutter create *)",
+      "Bash(flutter pub *)",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\lucas\\\\OneDrive\\\\Área de Trabalho\\\\FACULDADE\\\\DesenvolvimentoMobile\\\\aula2505\\\\atv5\" -Recurse -Force)",
+      "Bash(Select-Object FullName, PSIsContainer)",
+      "Bash(Sort-Object FullName)",
+      "Bash(Format-Table -AutoSize)",
+      "Read(//c/Users/lucas/OneDrive/�rea de Trabalho/FACULDADE/DesenvolvimentoMobile/aula2505/**)",
+      "Bash(flutter devices *)",
+      "Bash(flutter emulators *)",
+      "Bash(flutter run *)",
+      "Bash(flutter doctor *)"
+    ]
+  }
+}
