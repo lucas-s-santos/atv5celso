@@ -218,8 +218,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       ),
       body: Column(
         children: [
-          // Banner offline
-          if (provider.usingLocalData)
+          // Banner offline (oculta enquanto sincronização está em andamento)
+          if (provider.usingLocalData && !provider.isSyncing)
             Container(
               color: Colors.orange.shade700,
               width: double.infinity,

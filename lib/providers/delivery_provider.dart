@@ -48,7 +48,8 @@ class DeliveryProvider extends ChangeNotifier {
 
       deliveries = fbDeliveries;
       if (fbDeliveries.isNotEmpty) await _db.replaceAll(fbDeliveries);
-    } catch (_) {
+    } catch (e) {
+      debugPrint('[Firebase] sync error: $e');
       usingLocalData = true;
     } finally {
       isSyncing = false;
