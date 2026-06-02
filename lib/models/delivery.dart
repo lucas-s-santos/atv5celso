@@ -32,13 +32,13 @@ class Delivery {
 
   factory Delivery.fromMap(Map<String, dynamic> map) => Delivery(
         id: map['id'],
-        codigo: map['codigo'],
-        nomeDestinatario: map['nomeDestinatario'],
-        endereco: map['endereco'],
-        status: map['status'],
-        latitude: map['latitude'],
-        longitude: map['longitude'],
-        dataHoraAtualizacao: map['dataHoraAtualizacao'],
+        codigo: map['codigo'] ?? '',
+        nomeDestinatario: map['nomeDestinatario'] ?? '',
+        endereco: map['endereco'] ?? '',
+        status: map['status'] ?? 'pendente',
+        latitude: (map['latitude'] as num?)?.toDouble() ?? 0.0,
+        longitude: (map['longitude'] as num?)?.toDouble() ?? 0.0,
+        dataHoraAtualizacao: map['dataHoraAtualizacao'] ?? '',
       );
 
   Delivery copyWith({

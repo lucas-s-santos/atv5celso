@@ -35,9 +35,10 @@ class DeliveryProvider extends ChangeNotifier {
     isSyncing = true;
     notifyListeners();
     try {
+      // ── Leitura do Firebase ──────────────────────────────────────────────
       final fbDeliveries = await _firebase.fetchAll();
-      usingLocalData = false;
 
+      // Detecta novas entregas vindas de outros dispositivos
       if (_knownIds.isNotEmpty) {
         final brandNew = fbDeliveries
             .where((d) => d.id != null && !_knownIds.contains(d.id))
@@ -46,10 +47,19 @@ class DeliveryProvider extends ChangeNotifier {
       }
       _knownIds = fbDeliveries.map((d) => d.id).whereType<int>().toSet();
 
+      // Firebase respondeu com sucesso — conexão está ativa
+      usingLocalData = false;
       deliveries = fbDeliveries;
-      if (fbDeliveries.isNotEmpty) await _db.replaceAll(fbDeliveries);
+
+      // ── Atualiza SQLite em paralelo (erro aqui não afeta o status de conexão) ──
+      if (fbDeliveries.isNotEmpty) {
+        _db.replaceAll(fbDeliveries).catchError((e) {
+          debugPrint('[SQLite] replaceAll: $e');
+        });
+      }
     } catch (e) {
-      debugPrint('[Firebase] sync error: $e');
+      // Só marca como offline se o Firebase de fato não respondeu
+      debugPrint('[Firebase] sync: $e');
       usingLocalData = true;
     } finally {
       isSyncing = false;
