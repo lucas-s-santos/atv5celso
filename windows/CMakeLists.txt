@@ -10,6 +10,9 @@ set(BINARY_NAME "atv5")
 # versions of CMake.
 cmake_policy(VERSION 3.14...3.25)
 
+# Fix para Firebase C++ SDK com CMake >= 4.x
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+
 # Define build configuration option.
 get_property(IS_MULTICONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
 if(IS_MULTICONFIG)

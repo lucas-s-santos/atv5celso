@@ -1,10 +1,13 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io' show Platform;
 import 'dart:ui' as ui;
+import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:sqflite_common_ffi_web/sqflite_ffi_web.dart';
+import 'firebase_options.dart';
 import 'package:path/path.dart' as p;
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
@@ -95,6 +98,31 @@ class Delivery {
       );
 }
 
+// ─── STATUS ENTRY ────────────────────────────────────────────────────────────
+
+class StatusEntry {
+  final int? id;
+  final int deliveryId;
+  final String status;
+  final String dataHora;
+
+  StatusEntry({this.id, required this.deliveryId, required this.status, required this.dataHora});
+
+  factory StatusEntry.fromMap(Map<String, dynamic> map) => StatusEntry(
+        id: map['id'],
+        deliveryId: map['deliveryId'],
+        status: map['status'],
+        dataHora: map['dataHora'],
+      );
+
+  Map<String, dynamic> toMap() => {
+        'id': id,
+        'deliveryId': deliveryId,
+        'status': status,
+        'dataHora': dataHora,
+      };
+}
+
 // ─── DATABASE ────────────────────────────────────────────────────────────────
 
 class DatabaseHelper {
@@ -108,19 +136,41 @@ class DatabaseHelper {
     final path = p.join(await getDatabasesPath(), 'entregas.db');
     return openDatabase(
       path,
-      version: 1,
-      onCreate: (db, _) => db.execute('''
-        CREATE TABLE deliveries (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          codigo TEXT NOT NULL,
-          nomeDestinatario TEXT NOT NULL,
-          endereco TEXT NOT NULL,
-          status TEXT NOT NULL,
-          latitude REAL NOT NULL,
-          longitude REAL NOT NULL,
-          dataHoraAtualizacao TEXT NOT NULL
-        )
-      '''),
+      version: 2,
+      onCreate: (db, _) async {
+        await db.execute('''
+          CREATE TABLE deliveries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            codigo TEXT NOT NULL,
+            nomeDestinatario TEXT NOT NULL,
+            endereco TEXT NOT NULL,
+            status TEXT NOT NULL,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL,
+            dataHoraAtualizacao TEXT NOT NULL
+          )
+        ''');
+        await db.execute('''
+          CREATE TABLE status_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            deliveryId INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            dataHora TEXT NOT NULL
+          )
+        ''');
+      },
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          await db.execute('''
+            CREATE TABLE IF NOT EXISTS status_history (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              deliveryId INTEGER NOT NULL,
+              status TEXT NOT NULL,
+              dataHora TEXT NOT NULL
+            )
+          ''');
+        }
+      },
     );
   }
 
@@ -143,7 +193,78 @@ class DatabaseHelper {
 
   Future<int> delete(int id) async {
     final db = await database;
+    await db.delete('status_history', where: 'deliveryId = ?', whereArgs: [id]);
     return db.delete('deliveries', where: 'id = ?', whereArgs: [id]);
+  }
+
+  Future<void> replaceAll(List<Delivery> deliveries) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      await txn.delete('deliveries');
+      for (final d in deliveries) {
+        await txn.insert('deliveries', d.toMap());
+      }
+    });
+  }
+
+  Future<void> insertHistory(StatusEntry entry) async {
+    final db = await database;
+    await db.insert('status_history', entry.toMap()..remove('id'));
+  }
+
+  Future<List<StatusEntry>> fetchHistory(int deliveryId) async {
+    final db = await database;
+    return (await db.query(
+      'status_history',
+      where: 'deliveryId = ?',
+      whereArgs: [deliveryId],
+      orderBy: 'id DESC',
+    )).map(StatusEntry.fromMap).toList();
+  }
+}
+
+// ─── FIREBASE SERVICE (REST API) ─────────────────────────────────────────────
+
+class FirebaseService {
+  static const _dbUrl = 'https://atv5-entrega-default-rtdb.firebaseio.com';
+
+  Future<List<Delivery>> fetchAll() async {
+    final response = await http
+        .get(Uri.parse('$_dbUrl/deliveries.json'))
+        .timeout(const Duration(seconds: 10));
+
+    if (response.statusCode != 200) throw Exception('HTTP ${response.statusCode}');
+
+    final data = jsonDecode(response.body);
+    if (data == null) return [];
+
+    return (data as Map).entries.map((e) {
+      final map = Map<String, dynamic>.from(e.value as Map);
+      map['id'] = int.tryParse(e.key.toString());
+      return Delivery.fromMap(map);
+    }).toList()
+      ..sort((a, b) => (b.id ?? 0).compareTo(a.id ?? 0));
+  }
+
+  Future<void> upsert(Delivery d) async {
+    final map = Map<String, dynamic>.from(d.toMap())..remove('id');
+    final response = await http
+        .put(
+          Uri.parse('$_dbUrl/deliveries/${d.id}.json'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode(map),
+        )
+        .timeout(const Duration(seconds: 10));
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('HTTP ${response.statusCode}');
+    }
+  }
+
+  Future<void> delete(int id) async {
+    await http
+        .delete(Uri.parse('$_dbUrl/deliveries/$id.json'))
+        .timeout(const Duration(seconds: 10));
   }
 }
 
@@ -246,16 +367,109 @@ class GeocodingService {
 
 class DeliveryProvider extends ChangeNotifier {
   final _db = DatabaseHelper.instance;
+  final _firebase = FirebaseService();
   List<Delivery> deliveries = [];
+  bool usingLocalData = false;
+  bool isSyncing = false;
+  List<Delivery> newDeliveriesFromSync = [];
+  Set<int> _knownIds = {};
+  Timer? _pollTimer;
+
+  @override
+  void dispose() {
+    _pollTimer?.cancel();
+    super.dispose();
+  }
 
   Future<void> load() async {
+    deliveries = await _db.fetchAll();
+    _knownIds = deliveries.map((d) => d.id).whereType<int>().toSet();
+    notifyListeners();
+    await _syncFromFirebase();
+    _startPolling();
+  }
+
+  Future<void> _syncFromFirebase() async {
+    isSyncing = true;
+    notifyListeners();
+    try {
+      final fbDeliveries = await _firebase.fetchAll();
+      usingLocalData = false;
+
+      if (_knownIds.isNotEmpty) {
+        final brandNew = fbDeliveries
+            .where((d) => d.id != null && !_knownIds.contains(d.id))
+            .toList();
+        if (brandNew.isNotEmpty) newDeliveriesFromSync = brandNew;
+      }
+      _knownIds = fbDeliveries.map((d) => d.id).whereType<int>().toSet();
+
+      deliveries = fbDeliveries;
+      if (fbDeliveries.isNotEmpty) await _db.replaceAll(fbDeliveries);
+    } catch (_) {
+      usingLocalData = true;
+    } finally {
+      isSyncing = false;
+      notifyListeners();
+    }
+  }
+
+  void clearNewDeliveries() => newDeliveriesFromSync = [];
+
+  void _startPolling() {
+    _pollTimer?.cancel();
+    _pollTimer = Timer.periodic(
+      const Duration(seconds: 3),
+      (_) => _syncFromFirebase(),
+    );
+  }
+
+  Future<void> add(Delivery d) async {
+    final id = await _db.insert(d);
+    final withId = d.copyWith(id: id);
+    await _db.insertHistory(StatusEntry(
+      deliveryId: id,
+      status: d.status,
+      dataHora: d.dataHoraAtualizacao,
+    ));
+    try {
+      await _firebase.upsert(withId);
+    } catch (e) {
+      debugPrint('[Firebase] Erro ao salvar: $e');
+    }
     deliveries = await _db.fetchAll();
     notifyListeners();
   }
 
-  Future<void> add(Delivery d) async { await _db.insert(d); await load(); }
-  Future<void> update(Delivery d) async { await _db.update(d); await load(); }
-  Future<void> remove(int id) async { await _db.delete(id); await load(); }
+  Future<void> update(Delivery d) async {
+    final old = deliveries.firstWhere((x) => x.id == d.id, orElse: () => d);
+    if (old.status != d.status) {
+      await _db.insertHistory(StatusEntry(
+        deliveryId: d.id!,
+        status: d.status,
+        dataHora: DateFormat('dd/MM/yyyy HH:mm').format(DateTime.now()),
+      ));
+    }
+    await _db.update(d);
+    try {
+      await _firebase.upsert(d);
+    } catch (e) {
+      debugPrint('[Firebase] Erro ao atualizar: $e');
+    }
+    deliveries = await _db.fetchAll();
+    notifyListeners();
+  }
+
+  Future<void> remove(int id) async {
+    await _db.delete(id);
+    try {
+      await _firebase.delete(id);
+    } catch (e) {
+      debugPrint('[Firebase] Erro ao excluir: $e');
+    }
+    deliveries = await _db.fetchAll();
+    notifyListeners();
+  }
 }
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
@@ -280,7 +494,7 @@ IconData statusIcon(String status) {
 
 // ─── MAIN ────────────────────────────────────────────────────────────────────
 
-void main() {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   if (kIsWeb) {
     databaseFactory = databaseFactoryFfiWeb;
@@ -288,6 +502,7 @@ void main() {
     sqfliteFfiInit();
     databaseFactory = databaseFactoryFfi;
   }
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
   runApp(
     ChangeNotifierProvider(
       create: (_) => DeliveryProvider(),
@@ -327,120 +542,264 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
+  bool _searchActive = false;
+  final _searchCtrl = TextEditingController();
+  String _searchQuery = '';
+  String _filterStatus = '';
+
+  static const _statusFilters = [
+    ('', 'Todos'),
+    ('pendente', 'Pendente'),
+    ('em transporte', 'Transporte'),
+    ('saiu para entrega', 'Saiu'),
+    ('entregue', 'Entregue'),
+  ];
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       context.read<DeliveryProvider>().load();
     });
+    _searchCtrl.addListener(() => setState(() => _searchQuery = _searchCtrl.text));
+  }
+
+  @override
+  void dispose() {
+    _searchCtrl.dispose();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     final provider = context.watch<DeliveryProvider>();
-    final deliveries = provider.deliveries;
+    final all = provider.deliveries;
 
-    final pendentes    = deliveries.where((d) => d.status == 'pendente').length;
-    final emRota       = deliveries.where((d) => d.status == 'em transporte').length;
-    final saiuEntrega  = deliveries.where((d) => d.status == 'saiu para entrega').length;
-    final entregues    = deliveries.where((d) => d.status == 'entregue').length;
+    // ── Notificação de nova entrega ──────────────────────────────────────
+    if (provider.newDeliveriesFromSync.isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        final count = provider.newDeliveriesFromSync.length;
+        provider.clearNewDeliveries();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Row(children: [
+              const Icon(Icons.cloud_download, color: Colors.white, size: 18),
+              const SizedBox(width: 10),
+              Text('$count nova${count > 1 ? 's entregas recebidas' : ' entrega recebida'} do Firebase'),
+            ]),
+            backgroundColor: AppColors.primaryLight,
+            behavior: SnackBarBehavior.floating,
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      });
+    }
+
+    // ── Filtro + busca ───────────────────────────────────────────────────
+    var shown = all;
+    if (_filterStatus.isNotEmpty) {
+      shown = shown.where((d) => d.status == _filterStatus).toList();
+    }
+    if (_searchQuery.trim().isNotEmpty) {
+      final q = _searchQuery.trim().toLowerCase();
+      shown = shown
+          .where((d) =>
+              d.codigo.toLowerCase().contains(q) ||
+              d.nomeDestinatario.toLowerCase().contains(q))
+          .toList();
+    }
+
+    final pendentes   = all.where((d) => d.status == 'pendente').length;
+    final emRota      = all.where((d) => d.status == 'em transporte').length;
+    final saiuEntrega = all.where((d) => d.status == 'saiu para entrega').length;
+    final entregues   = all.where((d) => d.status == 'entregue').length;
 
     return Scaffold(
       backgroundColor: AppColors.surface,
       body: CustomScrollView(
         slivers: [
-          // ── AppBar com gradiente ──────────────────────────────────────────
+          // ── AppBar ───────────────────────────────────────────────────────
           SliverAppBar(
-            expandedHeight: 130,
+            expandedHeight: _searchActive ? 0 : 130,
             pinned: true,
-            flexibleSpace: FlexibleSpaceBar(
-              background: Container(
-                decoration: const BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                    colors: [AppColors.primaryDark, AppColors.primaryLight],
-                  ),
-                ),
-                child: Padding(
-                  padding: const EdgeInsets.fromLTRB(20, 48, 20, 12),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.end,
-                    children: [
-                      const Icon(Icons.local_shipping,
-                          color: Colors.white70, size: 32),
-                      const SizedBox(width: 10),
-                      Column(
-                        mainAxisSize: MainAxisSize.min,
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Text(
-                            'Entregas',
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 24,
-                              fontWeight: FontWeight.bold,
-                              letterSpacing: 0.5,
-                            ),
-                          ),
-                          Text(
-                            '${deliveries.length} registro${deliveries.length != 1 ? 's' : ''}',
-                            style: const TextStyle(
-                              color: Colors.white60,
-                              fontSize: 13,
-                            ),
-                          ),
-                        ],
+            flexibleSpace: _searchActive
+                ? null
+                : FlexibleSpaceBar(
+                    background: Container(
+                      decoration: const BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                          colors: [AppColors.primaryDark, AppColors.primaryLight],
+                        ),
                       ),
-                    ],
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(20, 48, 20, 12),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            const Icon(Icons.local_shipping, color: Colors.white70, size: 32),
+                            const SizedBox(width: 10),
+                            Column(
+                              mainAxisSize: MainAxisSize.min,
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text('Entregas',
+                                    style: TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 24,
+                                        fontWeight: FontWeight.bold,
+                                        letterSpacing: 0.5)),
+                                Text(
+                                  '${all.length} registro${all.length != 1 ? 's' : ''}',
+                                  style: const TextStyle(color: Colors.white60, fontSize: 13),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
                   ),
-                ),
-              ),
-            ),
             backgroundColor: AppColors.primary,
             foregroundColor: Colors.white,
+            title: _searchActive
+                ? TextField(
+                    controller: _searchCtrl,
+                    autofocus: true,
+                    style: const TextStyle(color: Colors.white),
+                    cursorColor: Colors.white,
+                    decoration: const InputDecoration(
+                      hintText: 'Buscar por código ou destinatário...',
+                      hintStyle: TextStyle(color: Colors.white54),
+                      border: InputBorder.none,
+                    ),
+                  )
+                : null,
             actions: [
+              // Spinner de sincronização
+              if (provider.isSyncing)
+                const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 10),
+                  child: SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(
+                        color: Colors.white, strokeWidth: 2),
+                  ),
+                ),
+              // Botão busca
               IconButton(
-                icon: const Icon(Icons.map_outlined),
-                tooltip: 'Mapa de Entregas',
-                onPressed: () => Navigator.push(context,
-                    MaterialPageRoute(builder: (_) => const DeliveriesMapScreen())),
+                icon: Icon(_searchActive ? Icons.close : Icons.search),
+                tooltip: _searchActive ? 'Fechar busca' : 'Buscar',
+                onPressed: () => setState(() {
+                  _searchActive = !_searchActive;
+                  if (!_searchActive) {
+                    _searchCtrl.clear();
+                    _searchQuery = '';
+                  }
+                }),
               ),
+              if (!_searchActive)
+                IconButton(
+                  icon: const Icon(Icons.map_outlined),
+                  tooltip: 'Mapa de Entregas',
+                  onPressed: () => Navigator.push(context,
+                      MaterialPageRoute(builder: (_) => const DeliveriesMapScreen())),
+                ),
               const SizedBox(width: 4),
             ],
           ),
 
+          // ── Banner offline ───────────────────────────────────────────────
+          if (provider.usingLocalData)
+            SliverToBoxAdapter(
+              child: Container(
+                color: Colors.orange.shade700,
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                child: const Row(children: [
+                  Icon(Icons.cloud_off, color: Colors.white, size: 16),
+                  SizedBox(width: 8),
+                  Text(
+                    'Sem conexão com Firebase — exibindo dados locais',
+                    style: TextStyle(
+                        color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600),
+                  ),
+                ]),
+              ),
+            ),
+
           // ── Stats bar ────────────────────────────────────────────────────
-          if (deliveries.isNotEmpty)
+          if (all.isNotEmpty)
             SliverToBoxAdapter(
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
-                child: Row(
-                  children: [
-                    _StatChip(label: 'Pendente',  value: pendentes,   color: AppColors.pending),
-                    const SizedBox(width: 8),
-                    _StatChip(label: 'Transporte', value: emRota,     color: AppColors.inTransit),
-                    const SizedBox(width: 8),
-                    _StatChip(label: 'Saiu',       value: saiuEntrega,color: AppColors.outForDelivery),
-                    const SizedBox(width: 8),
-                    _StatChip(label: 'Entregue',   value: entregues,  color: AppColors.delivered),
-                  ],
+                child: Row(children: [
+                  _StatChip(label: 'Pendente',   value: pendentes,   color: AppColors.pending),
+                  const SizedBox(width: 8),
+                  _StatChip(label: 'Transporte', value: emRota,      color: AppColors.inTransit),
+                  const SizedBox(width: 8),
+                  _StatChip(label: 'Saiu',       value: saiuEntrega, color: AppColors.outForDelivery),
+                  const SizedBox(width: 8),
+                  _StatChip(label: 'Entregue',   value: entregues,   color: AppColors.delivered),
+                ]),
+              ),
+            ),
+
+          // ── Chips de filtro ──────────────────────────────────────────────
+          if (all.isNotEmpty)
+            SliverToBoxAdapter(
+              child: SizedBox(
+                height: 44,
+                child: ListView(
+                  scrollDirection: Axis.horizontal,
+                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                  children: _statusFilters.map((f) {
+                    final selected = _filterStatus == f.$1;
+                    final chipColor = f.$1.isEmpty
+                        ? AppColors.primary
+                        : statusColor(f.$1);
+                    return Padding(
+                      padding: const EdgeInsets.only(right: 8),
+                      child: FilterChip(
+                        label: Text(f.$2),
+                        selected: selected,
+                        onSelected: (_) =>
+                            setState(() => _filterStatus = f.$1),
+                        selectedColor: chipColor.withValues(alpha: 0.2),
+                        checkmarkColor: chipColor,
+                        labelStyle: TextStyle(
+                          color: selected ? chipColor : const Color(0xFF6B7280),
+                          fontWeight: selected ? FontWeight.w700 : FontWeight.normal,
+                          fontSize: 12,
+                        ),
+                        side: BorderSide(
+                          color: selected
+                              ? chipColor.withValues(alpha: 0.6)
+                              : const Color(0xFFE5E7EB),
+                        ),
+                        backgroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(horizontal: 4),
+                      ),
+                    );
+                  }).toList(),
                 ),
               ),
             ),
 
           // ── Lista de entregas ─────────────────────────────────────────────
-          deliveries.isEmpty
+          shown.isEmpty
               ? SliverFillRemaining(child: _EmptyState())
               : SliverPadding(
-                  padding: const EdgeInsets.fromLTRB(16, 16, 16, 100),
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 100),
                   sliver: SliverList(
                     delegate: SliverChildBuilderDelegate(
                       (context, index) => _DeliveryCard(
-                        delivery: deliveries[index],
+                        delivery: shown[index],
                         provider: provider,
                       ),
-                      childCount: deliveries.length,
+                      childCount: shown.length,
                     ),
                   ),
                 ),
@@ -453,8 +812,7 @@ class _HomeScreenState extends State<HomeScreen> {
         foregroundColor: Colors.white,
         elevation: 4,
         icon: const Icon(Icons.add),
-        label: const Text('Nova Entrega',
-            style: TextStyle(fontWeight: FontWeight.w600)),
+        label: const Text('Nova Entrega', style: TextStyle(fontWeight: FontWeight.w600)),
       ),
     );
   }
@@ -544,14 +902,37 @@ class _EmptyState extends StatelessWidget {
 
 // ── Delivery card ────────────────────────────────────────────────────────────
 
-class _DeliveryCard extends StatelessWidget {
+class _DeliveryCard extends StatefulWidget {
   final Delivery delivery;
   final DeliveryProvider provider;
   const _DeliveryCard({required this.delivery, required this.provider});
 
   @override
+  State<_DeliveryCard> createState() => _DeliveryCardState();
+}
+
+class _DeliveryCardState extends State<_DeliveryCard> {
+  bool _historyExpanded = false;
+  List<StatusEntry> _history = [];
+  bool _loadingHistory = false;
+
+  Future<void> _toggleHistory() async {
+    if (_historyExpanded) {
+      setState(() => _historyExpanded = false);
+      return;
+    }
+    setState(() => _loadingHistory = true);
+    final h = await DatabaseHelper.instance.fetchHistory(widget.delivery.id!);
+    setState(() {
+      _history = h;
+      _historyExpanded = true;
+      _loadingHistory = false;
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final d = delivery;
+    final d = widget.delivery;
     final color = statusColor(d.status);
 
     return Container(
@@ -569,179 +950,234 @@ class _DeliveryCard extends StatelessWidget {
       ),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(16),
-        child: IntrinsicHeight(
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              // Borda colorida esquerda
-              Container(width: 5, color: color),
-              // Conteúdo
-              Expanded(
-                child: Padding(
-                  padding: const EdgeInsets.fromLTRB(14, 14, 4, 14),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      // Ícone de status
-                      Container(
-                        width: 48,
-                        height: 48,
-                        decoration: BoxDecoration(
-                          color: color.withValues(alpha: 0.1),
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        child: Icon(statusIcon(d.status), color: color, size: 26),
-                      ),
-                      const SizedBox(width: 12),
-                      // Textos
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
+        child: Column(
+          children: [
+            IntrinsicHeight(
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Container(width: 5, color: color),
+                  Expanded(
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(14, 14, 4, 14),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Container(
+                            width: 48,
+                            height: 48,
+                            decoration: BoxDecoration(
+                              color: color.withValues(alpha: 0.1),
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: Icon(statusIcon(d.status), color: color, size: 26),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                Expanded(
-                                  child: Text(
-                                    d.codigo,
+                                Text(d.codigo,
                                     style: const TextStyle(
-                                      fontWeight: FontWeight.bold,
-                                      fontSize: 15,
-                                      color: Color(0xFF111827),
-                                    ),
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 15,
+                                        color: Color(0xFF111827))),
+                                const SizedBox(height: 2),
+                                Text(d.nomeDestinatario,
+                                    style: const TextStyle(
+                                        fontSize: 14,
+                                        color: Color(0xFF374151),
+                                        fontWeight: FontWeight.w500)),
+                                Text(d.endereco,
+                                    style: const TextStyle(
+                                        fontSize: 12, color: Color(0xFF6B7280)),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis),
+                                const SizedBox(height: 8),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 10, vertical: 4),
+                                  decoration: BoxDecoration(
+                                    color: color.withValues(alpha: 0.1),
+                                    borderRadius: BorderRadius.circular(20),
+                                    border: Border.all(
+                                        color: color.withValues(alpha: 0.4),
+                                        width: 1),
                                   ),
+                                  child: Text(d.status,
+                                      style: TextStyle(
+                                          color: color,
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.w700,
+                                          letterSpacing: 0.2)),
                                 ),
+                                const SizedBox(height: 8),
+                                Row(children: [
+                                  const Icon(Icons.location_on_outlined,
+                                      size: 12, color: Color(0xFF9CA3AF)),
+                                  const SizedBox(width: 3),
+                                  Text(
+                                    '${d.latitude.toStringAsFixed(5)}, ${d.longitude.toStringAsFixed(5)}',
+                                    style: const TextStyle(
+                                        fontSize: 11, color: Color(0xFF9CA3AF)),
+                                  ),
+                                ]),
+                                const SizedBox(height: 2),
+                                Row(children: [
+                                  const Icon(Icons.schedule,
+                                      size: 12, color: Color(0xFF9CA3AF)),
+                                  const SizedBox(width: 3),
+                                  Text(d.dataHoraAtualizacao,
+                                      style: const TextStyle(
+                                          fontSize: 11, color: Color(0xFF9CA3AF))),
+                                ]),
                               ],
                             ),
-                            const SizedBox(height: 2),
-                            Text(
-                              d.nomeDestinatario,
-                              style: const TextStyle(
-                                fontSize: 14,
-                                color: Color(0xFF374151),
-                                fontWeight: FontWeight.w500,
-                              ),
-                            ),
-                            Text(
-                              d.endereco,
-                              style: const TextStyle(
-                                fontSize: 12,
-                                color: Color(0xFF6B7280),
-                              ),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                            const SizedBox(height: 8),
-                            // Badge de status
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                  horizontal: 10, vertical: 4),
-                              decoration: BoxDecoration(
-                                color: color.withValues(alpha: 0.1),
-                                borderRadius: BorderRadius.circular(20),
-                                border: Border.all(
-                                    color: color.withValues(alpha: 0.4),
-                                    width: 1),
-                              ),
-                              child: Text(
-                                d.status,
-                                style: TextStyle(
-                                  color: color,
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w700,
-                                  letterSpacing: 0.2,
-                                ),
-                              ),
-                            ),
-                            const SizedBox(height: 8),
-                            // GPS + Data
-                            Row(
-                              children: [
-                                const Icon(Icons.location_on_outlined,
-                                    size: 12, color: Color(0xFF9CA3AF)),
-                                const SizedBox(width: 3),
-                                Text(
-                                  '${d.latitude.toStringAsFixed(5)}, '
-                                  '${d.longitude.toStringAsFixed(5)}',
-                                  style: const TextStyle(
-                                      fontSize: 11, color: Color(0xFF9CA3AF)),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 2),
-                            Row(
-                              children: [
-                                const Icon(Icons.schedule,
-                                    size: 12, color: Color(0xFF9CA3AF)),
-                                const SizedBox(width: 3),
-                                Text(
-                                  d.dataHoraAtualizacao,
-                                  style: const TextStyle(
-                                      fontSize: 11, color: Color(0xFF9CA3AF)),
-                                ),
-                              ],
-                            ),
-                          ],
-                        ),
-                      ),
-                      // Menu
-                      PopupMenuButton<String>(
-                        icon: const Icon(Icons.more_vert,
-                            color: Color(0xFF9CA3AF), size: 20),
-                        onSelected: (value) async {
-                          if (value == 'editar') {
-                            await Navigator.push(
-                              context,
-                              MaterialPageRoute(
-                                builder: (_) => DeliveryFormScreen(delivery: d),
-                              ),
-                            );
-                          } else if (value == 'mapa') {
-                            Navigator.push(
-                              context,
-                              MaterialPageRoute(
-                                builder: (_) => DeliveriesMapScreen(focused: d),
-                              ),
-                            );
-                          } else if (value == 'excluir') {
-                            _confirmDelete(context);
-                          }
-                        },
-                        itemBuilder: (_) => [
-                          const PopupMenuItem(
-                            value: 'editar',
-                            child: Row(children: [
-                              Icon(Icons.edit_outlined, size: 18),
-                              SizedBox(width: 10),
-                              Text('Editar'),
-                            ]),
                           ),
-                          const PopupMenuItem(
-                            value: 'mapa',
-                            child: Row(children: [
-                              Icon(Icons.map_outlined, size: 18),
-                              SizedBox(width: 10),
-                              Text('Ver no mapa'),
-                            ]),
-                          ),
-                          const PopupMenuDivider(),
-                          PopupMenuItem(
-                            value: 'excluir',
-                            child: Row(children: [
-                              Icon(Icons.delete_outline,
-                                  size: 18, color: Colors.red[400]),
-                              const SizedBox(width: 10),
-                              Text('Excluir',
-                                  style: TextStyle(color: Colors.red[400])),
-                            ]),
+                          PopupMenuButton<String>(
+                            icon: const Icon(Icons.more_vert,
+                                color: Color(0xFF9CA3AF), size: 20),
+                            onSelected: (value) async {
+                              if (value == 'editar') {
+                                await Navigator.push(
+                                  context,
+                                  MaterialPageRoute(
+                                      builder: (_) =>
+                                          DeliveryFormScreen(delivery: d)),
+                                );
+                              } else if (value == 'mapa') {
+                                Navigator.push(
+                                  context,
+                                  MaterialPageRoute(
+                                      builder: (_) =>
+                                          DeliveriesMapScreen(focused: d)),
+                                );
+                              } else if (value == 'excluir') {
+                                _confirmDelete(context);
+                              }
+                            },
+                            itemBuilder: (_) => [
+                              const PopupMenuItem(
+                                value: 'editar',
+                                child: Row(children: [
+                                  Icon(Icons.edit_outlined, size: 18),
+                                  SizedBox(width: 10),
+                                  Text('Editar'),
+                                ]),
+                              ),
+                              const PopupMenuItem(
+                                value: 'mapa',
+                                child: Row(children: [
+                                  Icon(Icons.map_outlined, size: 18),
+                                  SizedBox(width: 10),
+                                  Text('Ver no mapa'),
+                                ]),
+                              ),
+                              const PopupMenuDivider(),
+                              PopupMenuItem(
+                                value: 'excluir',
+                                child: Row(children: [
+                                  Icon(Icons.delete_outline,
+                                      size: 18, color: Colors.red[400]),
+                                  const SizedBox(width: 10),
+                                  Text('Excluir',
+                                      style: TextStyle(color: Colors.red[400])),
+                                ]),
+                              ),
+                            ],
                           ),
                         ],
                       ),
-                    ],
+                    ),
                   ),
-                ),
+                ],
               ),
-            ],
-          ),
+            ),
+            // ── Botão histórico ────────────────────────────────────────────
+            InkWell(
+              onTap: _toggleHistory,
+              child: Container(
+                width: double.infinity,
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF9FAFB),
+                  border: Border(
+                      top: BorderSide(
+                          color: const Color(0xFFE5E7EB), width: 1)),
+                ),
+                child: Row(children: [
+                  Icon(
+                    _historyExpanded
+                        ? Icons.history_toggle_off
+                        : Icons.history,
+                    size: 14,
+                    color: AppColors.primaryLight,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    _loadingHistory
+                        ? 'Carregando histórico...'
+                        : _historyExpanded
+                            ? 'Ocultar histórico'
+                            : 'Ver histórico de status',
+                    style: const TextStyle(
+                        fontSize: 12,
+                        color: AppColors.primaryLight,
+                        fontWeight: FontWeight.w600),
+                  ),
+                  const Spacer(),
+                  Icon(
+                    _historyExpanded
+                        ? Icons.keyboard_arrow_up
+                        : Icons.keyboard_arrow_down,
+                    size: 16,
+                    color: AppColors.primaryLight,
+                  ),
+                ]),
+              ),
+            ),
+            // ── Histórico expandido ────────────────────────────────────────
+            if (_historyExpanded)
+              Container(
+                width: double.infinity,
+                color: const Color(0xFFF9FAFB),
+                padding:
+                    const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                child: _history.isEmpty
+                    ? const Text('Nenhum histórico registrado.',
+                        style: TextStyle(
+                            fontSize: 12, color: Color(0xFF9CA3AF)))
+                    : Column(
+                        children: _history.map((h) {
+                          final c = statusColor(h.status);
+                          return Padding(
+                            padding: const EdgeInsets.only(top: 8),
+                            child: Row(children: [
+                              Container(
+                                width: 8,
+                                height: 8,
+                                decoration: BoxDecoration(
+                                    color: c, shape: BoxShape.circle),
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Text(h.status,
+                                    style: TextStyle(
+                                        fontSize: 12,
+                                        color: c,
+                                        fontWeight: FontWeight.w600)),
+                              ),
+                              Text(h.dataHora,
+                                  style: const TextStyle(
+                                      fontSize: 11,
+                                      color: Color(0xFF9CA3AF))),
+                            ]),
+                          );
+                        }).toList(),
+                      ),
+              ),
+          ],
         ),
       ),
     );
@@ -753,7 +1189,7 @@ class _DeliveryCard extends StatelessWidget {
       builder: (ctx) => AlertDialog(
         title: const Text('Excluir entrega?'),
         content: Text(
-            'A entrega "${delivery.codigo}" será removida permanentemente.'),
+            'A entrega "${widget.delivery.codigo}" será removida permanentemente.'),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(ctx),
@@ -761,7 +1197,7 @@ class _DeliveryCard extends StatelessWidget {
           FilledButton(
             onPressed: () {
               Navigator.pop(ctx);
-              provider.remove(delivery.id!);
+              widget.provider.remove(widget.delivery.id!);
             },
             style: FilledButton.styleFrom(backgroundColor: Colors.red),
             child: const Text('Excluir'),
