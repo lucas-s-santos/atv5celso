@@ -223,19 +223,34 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
             Container(
               color: Colors.orange.shade700,
               width: double.infinity,
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              child: const Row(children: [
-                Icon(Icons.cloud_off_rounded, color: Colors.white, size: 14),
-                SizedBox(width: 8),
-                Text(
-                  'Sem conexão — exibindo dados locais',
-                  style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w600),
-                ),
-              ]),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Row(children: [
+                    Icon(Icons.cloud_off_rounded, color: Colors.white, size: 14),
+                    SizedBox(width: 8),
+                    Text(
+                      'Sem conexão — exibindo dados locais',
+                      style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600),
+                    ),
+                  ]),
+                  if (provider.syncError != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2, left: 22),
+                      child: Text(
+                        provider.syncError!,
+                        style: const TextStyle(
+                            color: Colors.white70, fontSize: 10),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                ],
+              ),
             ),
 
           // Hero card com totais

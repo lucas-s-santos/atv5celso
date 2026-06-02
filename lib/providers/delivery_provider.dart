@@ -13,6 +13,7 @@ class DeliveryProvider extends ChangeNotifier {
   List<Delivery> deliveries = [];
   bool usingLocalData = false;
   bool isSyncing = false;
+  String? syncError;
   List<Delivery> newDeliveriesFromSync = [];
   Set<int> _knownIds = {};
   Timer? _pollTimer;
@@ -58,8 +59,8 @@ class DeliveryProvider extends ChangeNotifier {
         });
       }
     } catch (e) {
-      // Só marca como offline se o Firebase de fato não respondeu
       debugPrint('[Firebase] sync: $e');
+      syncError = e.toString();
       usingLocalData = true;
     } finally {
       isSyncing = false;
