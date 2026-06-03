@@ -78,8 +78,12 @@ class _FormScreenState extends State<FormScreen> {
       _loadingGps = false;
     });
     _moveMap();
-    final address = await GeocodingService().reverseGeocode(pos.latitude, pos.longitude);
-    if (mounted && address != null) setState(() => _enderecoCtrl.text = address);
+    try {
+      final address = await GeocodingService().reverseGeocode(pos.latitude, pos.longitude);
+      if (mounted && address != null) setState(() => _enderecoCtrl.text = address);
+    } catch (_) {
+      // Sem internet: geocoding falha silenciosamente, usuário digita o endereço
+    }
   }
 
   Future<void> _geocodeAddress() async {
