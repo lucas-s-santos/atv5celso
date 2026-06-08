@@ -218,40 +218,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       ),
       body: Column(
         children: [
-          // Banner offline (oculta enquanto sincronização está em andamento)
-          if (provider.usingLocalData && !provider.isSyncing)
-            Container(
-              color: Colors.orange.shade700,
-              width: double.infinity,
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Row(children: [
-                    Icon(Icons.cloud_off_rounded, color: Colors.white, size: 14),
-                    SizedBox(width: 8),
-                    Text(
-                      'Sem conexão — exibindo dados locais',
-                      style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600),
-                    ),
-                  ]),
-                  if (provider.syncError != null)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 2, left: 22),
-                      child: Text(
-                        provider.syncError!,
-                        style: const TextStyle(
-                            color: Colors.white70, fontSize: 10),
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                ],
-              ),
-            ),
+          // Banner offline / reconectado
+          _OfflineBanner(provider: provider),
 
           // Hero card com totais
           _HeroCard(deliveries: all),
@@ -399,6 +367,97 @@ class _MiniStat extends StatelessWidget {
         Text(label,
             style: const TextStyle(color: Colors.white60, fontSize: 12)),
       ],
+    );
+  }
+}
+
+// ── Offline banner ────────────────────────────────────────────────────────────
+
+class _OfflineBanner extends StatelessWidget {
+  final DeliveryProvider provider;
+  const _OfflineBanner({required this.provider});
+
+  @override
+  Widget build(BuildContext context) {
+    final isOffline = provider.usingLocalData && !provider.isSyncing;
+    final isSynced = provider.syncedAfterOffline && !provider.usingLocalData;
+
+    Widget? banner;
+
+    if (isOffline) {
+      banner = _buildBanner(
+        key: const ValueKey('offline'),
+        color: Colors.orange.shade700,
+        icon: Icons.cloud_off_rounded,
+        title: 'Sem conexão com a internet',
+        subtitle:
+            'Dados salvos localmente • Sincronização automática ao reconectar',
+      );
+    } else if (isSynced) {
+      banner = _buildBanner(
+        key: const ValueKey('synced'),
+        color: Colors.green.shade700,
+        icon: Icons.cloud_done_rounded,
+        title: 'Reconectado! Dados sincronizados com Firebase',
+        subtitle: null,
+      );
+    }
+
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 350),
+      transitionBuilder: (child, animation) => SizeTransition(
+        sizeFactor: animation,
+        child: FadeTransition(opacity: animation, child: child),
+      ),
+      child: banner ?? const SizedBox.shrink(key: ValueKey('none')),
+    );
+  }
+
+  Widget _buildBanner({
+    required Key key,
+    required Color color,
+    required IconData icon,
+    required String title,
+    required String? subtitle,
+  }) {
+    return Container(
+      key: key,
+      color: color,
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, color: Colors.white, size: 18),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                if (subtitle != null) ...[
+                  const SizedBox(height: 2),
+                  Text(
+                    subtitle,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w400,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

@@ -13,6 +13,7 @@ class DeliveryProvider extends ChangeNotifier {
   List<Delivery> deliveries = [];
   bool usingLocalData = false;
   bool isSyncing = false;
+  bool syncedAfterOffline = false;
   String? syncError;
   List<Delivery> newDeliveriesFromSync = [];
   Set<int> _knownIds = {};
@@ -33,13 +34,14 @@ class DeliveryProvider extends ChangeNotifier {
   }
 
   Future<void> _syncFromFirebase() async {
+    final wasOffline = usingLocalData;
     isSyncing = true;
     notifyListeners();
     try {
       var fbDeliveries = await _firebase.fetchAll();
 
       // Ao reconectar: envia entregas criadas offline que não estão no Firebase
-      if (usingLocalData && deliveries.isNotEmpty) {
+      if (wasOffline && deliveries.isNotEmpty) {
         final fbIds = fbDeliveries.map((d) => d.id).whereType<int>().toSet();
         final pendentes = deliveries
             .where((d) => d.id != null && !fbIds.contains(d.id))
@@ -70,6 +72,15 @@ class DeliveryProvider extends ChangeNotifier {
       syncError = null;
       usingLocalData = false;
       deliveries = fbDeliveries;
+
+      // Banner verde de confirmação após reconexão
+      if (wasOffline) {
+        syncedAfterOffline = true;
+        Future.delayed(const Duration(seconds: 4), () {
+          syncedAfterOffline = false;
+          notifyListeners();
+        });
+      }
 
       if (fbDeliveries.isNotEmpty) {
         _db.replaceAll(fbDeliveries).catchError((e) {
